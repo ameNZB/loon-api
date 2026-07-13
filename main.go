@@ -32,6 +32,7 @@ import (
 	"github.com/ameNZB/loon/core"
 	"github.com/ameNZB/loon/schedule"
 
+	"github.com/ameNZB/loon-baseline/apikey"
 	"github.com/ameNZB/loon-baseline/cache"
 	cachememory "github.com/ameNZB/loon-baseline/cache/memory"
 	cacheredis "github.com/ameNZB/loon-baseline/cache/redis"
@@ -69,6 +70,15 @@ func main() {
 		logger.Error("job_settings migrate", "err", err)
 		os.Exit(1)
 	}
+	// API-key auth: resolve the ?apikey= a Newznab client sends to a user. Pure
+	// read (a SELECT), so this stays replica-safe. Keys are minted/rotated on the
+	// web tier; here we only validate. Migrate is idempotent.
+	apiKeys := apikey.NewPGStore(db.DB)
+	if err := apiKeys.Migrate(context.Background()); err != nil {
+		logger.Error("api_keys migrate", "err", err)
+		os.Exit(1)
+	}
+
 	apiSvc := schedule.RegisterService(apiServiceName, "Newznab/Torznab read tier (loon-api)")
 	apiSvc.DeclareConfig(settings,
 		schedule.JobConfigVar{Key: "cache_ttl_secs", Label: "Search cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "90",
@@ -166,12 +176,14 @@ func main() {
 		logger.Info("response cache + rate limiter", "backend", "memory")
 	}
 
-	// Per-caller request limiting (burst + daily quota), keyed by API key when
-	// present else client IP, limits read live from the admin settings (0 =
-	// off). A Newznab client sees the spec's "Request limit reached" error.
+	// Per-caller request limiting (burst + daily quota), keyed by the
+	// authenticated user (so the quota follows a caller across a key rotation)
+	// and falling back to client IP for keyless requests (caps discovery).
+	// Limits read live from the admin settings (0 = off). A Newznab client sees
+	// the spec's "Request limit reached" error.
 	limiter := ratelimit.Middleware(ratelimit.Config{
 		Counter: counter,
-		Key:     apiKeyOrIP,
+		Key:     rateKey,
 		Rules: []ratelimit.Rule{
 			{Name: "min", Window: time.Minute, Limit: func() int { return apiSvc.GetConfigInt("rate_per_min") }},
 			{Name: "day", Window: 24 * time.Hour, Limit: func() int { return apiSvc.GetConfigInt("rate_per_day") }},
@@ -179,9 +191,15 @@ func main() {
 		OnLimit: newznabLimitError,
 	})
 
+	// Newznab auth: a valid ?apikey= is required for everything except caps
+	// (capability discovery is keyless, matching common indexer behavior + how
+	// Prowlarr probes). Auth runs before the limiter so it can key by user id.
+	authAPI := requireAPIKey(apiKeys.Resolve, logger, func(g *gin.Context) bool { return g.Query("t") == "caps" })
+	authFeed := requireAPIKey(apiKeys.Resolve, logger, nil)
+
 	engine.GET("/healthz", func(g *gin.Context) { g.String(http.StatusOK, "ok") })
-	engine.GET("/api", limiter, newznab(api, responses, apiSvc)) // Newznab/Torznab: t=caps|search|tvsearch|movie|rss|get
-	engine.GET("/rss", limiter, newznab(api, responses, apiSvc))
+	engine.GET("/api", authAPI, limiter, newznab(api, responses, apiSvc)) // t=caps|search|tvsearch|movie|rss|get
+	engine.GET("/rss", authFeed, limiter, newznab(api, responses, apiSvc))
 	engine.GET("/nzb/:id", nzb(idx))
 
 	srv := &http.Server{Addr: getenv("LOON_API_ADDR", ":8091"), Handler: engine}
@@ -293,14 +311,50 @@ func ttlFor(svc *schedule.JobInfo, fn string) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// apiKeyOrIP attributes a request to a caller for rate limiting: the API key
-// when present, else the client IP. The k:/ip: prefixes keep the two key spaces
-// from colliding.
-func apiKeyOrIP(g *gin.Context) string {
-	if k := g.Query("apikey"); k != "" {
-		return "k:" + k
+// ctxUserID is the gin context key holding the authenticated user id (int64)
+// once requireAPIKey resolves a valid key.
+const ctxUserID = "uid"
+
+// requireAPIKey authenticates a request by its ?apikey=. On success it stashes
+// the user id for the limiter/handlers and continues. allowKeyless (may be nil)
+// lets specific requests through without a key — used for caps discovery. A
+// resolve error (DB blip) fails closed: we don't serve what we can't
+// authenticate. Everything else gets the Newznab "incorrect credentials" error.
+func requireAPIKey(resolve apikey.Resolver, logger *slog.Logger, allowKeyless func(*gin.Context) bool) gin.HandlerFunc {
+	return func(g *gin.Context) {
+		uid, ok, err := resolve(g.Request.Context(), g.Query("apikey"))
+		if err != nil {
+			logger.Warn("apikey resolve", "err", err)
+		}
+		if ok {
+			g.Set(ctxUserID, uid)
+			g.Next()
+			return
+		}
+		if allowKeyless != nil && allowKeyless(g) {
+			g.Next()
+			return
+		}
+		newznabAuthError(g)
+		g.Abort()
+	}
+}
+
+// rateKey attributes a request to a caller for rate limiting: the authenticated
+// user id when present (so a quota survives an API-key rotation), else the
+// client IP for keyless (caps) requests.
+func rateKey(g *gin.Context) string {
+	if uid, ok := g.Get(ctxUserID); ok {
+		return "u:" + strconv.FormatInt(uid.(int64), 10)
 	}
 	return "ip:" + g.ClientIP()
+}
+
+// newznabAuthError renders a missing/invalid-key rejection as a Newznab error
+// document (code 100 = "Incorrect user credentials" in the spec) + HTTP 401.
+func newznabAuthError(g *gin.Context) {
+	g.Data(http.StatusUnauthorized, "application/xml; charset=utf-8",
+		[]byte(`<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<error code="100" description="Incorrect user credentials"/>`))
 }
 
 // newznabLimitError renders an over-limit rejection as a Newznab error document

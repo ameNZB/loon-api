@@ -40,6 +40,7 @@ import (
 	"github.com/ameNZB/loon-baseline/ratelimit"
 	rlmemory "github.com/ameNZB/loon-baseline/ratelimit/memory"
 	rlredis "github.com/ameNZB/loon-baseline/ratelimit/redis"
+	"github.com/ameNZB/loon-baseline/users"
 
 	"github.com/ameNZB/loon-plugins/pluginapi"
 	_ "github.com/ameNZB/loon-plugins/usenet"
@@ -78,6 +79,22 @@ func main() {
 		logger.Error("api_keys migrate", "err", err)
 		os.Exit(1)
 	}
+	// Users are read (never written) here, only to resolve a caller's rank for
+	// per-rank rate limits. Migrate is idempotent — the web tier owns this table
+	// and creates it first; calling it here just keeps loon-api runnable
+	// standalone. A missing row / lookup error degrades to RoleUser (base limits).
+	userStore := users.NewPGStore(db.DB)
+	if err := userStore.Migrate(context.Background()); err != nil {
+		logger.Error("users migrate", "err", err)
+		os.Exit(1)
+	}
+	roleOf := func(ctx context.Context, uid int64) (core.Role, error) {
+		u, err := userStore.ByID(ctx, uid)
+		if err != nil {
+			return core.RoleUser, err
+		}
+		return u.Role, nil
+	}
 
 	apiSvc := schedule.RegisterService(apiServiceName, "Newznab/Torznab read tier (loon-api)")
 	apiSvc.DeclareConfig(settings,
@@ -89,6 +106,8 @@ func main() {
 			Description: "Per-API-key (or IP) request cap per minute — burst protection. 0 disables."},
 		schedule.JobConfigVar{Key: "rate_per_day", Label: "Requests per day", Type: schedule.JobConfigInt, Default: "10000",
 			Description: "Per-API-key (or IP) request cap per day — the daily quota. 0 disables."},
+		schedule.JobConfigVar{Key: "rate_contributor_mult", Label: "Contributor limit multiplier", Type: schedule.JobConfigInt, Default: "3",
+			Description: "Contributors get this multiple of the base per-minute/per-day limits. Mods/admins are exempt entirely."},
 	)
 
 	engine := gin.New()
@@ -185,17 +204,18 @@ func main() {
 		Counter: counter,
 		Key:     rateKey,
 		Rules: []ratelimit.Rule{
-			{Name: "min", Window: time.Minute, Limit: func() int { return apiSvc.GetConfigInt("rate_per_min") }},
-			{Name: "day", Window: 24 * time.Hour, Limit: func() int { return apiSvc.GetConfigInt("rate_per_day") }},
+			{Name: "min", Window: time.Minute, Limit: rankedLimit(apiSvc, "rate_per_min")},
+			{Name: "day", Window: 24 * time.Hour, Limit: rankedLimit(apiSvc, "rate_per_day")},
 		},
 		OnLimit: newznabLimitError,
 	})
 
 	// Newznab auth: a valid ?apikey= is required for everything except caps
 	// (capability discovery is keyless, matching common indexer behavior + how
-	// Prowlarr probes). Auth runs before the limiter so it can key by user id.
-	authAPI := requireAPIKey(apiKeys.Resolve, logger, func(g *gin.Context) bool { return g.Query("t") == "caps" })
-	authFeed := requireAPIKey(apiKeys.Resolve, logger, nil)
+	// Prowlarr probes). Auth runs before the limiter so it can key by user id
+	// and stash the caller's rank for per-rank limits.
+	authAPI := requireAPIKey(apiKeys.Resolve, roleOf, logger, func(g *gin.Context) bool { return g.Query("t") == "caps" })
+	authFeed := requireAPIKey(apiKeys.Resolve, roleOf, logger, nil)
 
 	engine.GET("/healthz", func(g *gin.Context) { g.String(http.StatusOK, "ok") })
 	engine.GET("/api", authAPI, limiter, newznab(api, responses, apiSvc)) // t=caps|search|tvsearch|movie|rss|get
@@ -311,23 +331,35 @@ func ttlFor(svc *schedule.JobInfo, fn string) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// ctxUserID is the gin context key holding the authenticated user id (int64)
-// once requireAPIKey resolves a valid key.
-const ctxUserID = "uid"
+// gin context keys set by requireAPIKey on a successful auth: the user id
+// (int64) and the caller's rank (int, a core.Role).
+const (
+	ctxUserID   = "uid"
+	ctxUserRole = "role"
+)
 
 // requireAPIKey authenticates a request by its ?apikey=. On success it stashes
-// the user id for the limiter/handlers and continues. allowKeyless (may be nil)
-// lets specific requests through without a key — used for caps discovery. A
-// resolve error (DB blip) fails closed: we don't serve what we can't
-// authenticate. Everything else gets the Newznab "incorrect credentials" error.
-func requireAPIKey(resolve apikey.Resolver, logger *slog.Logger, allowKeyless func(*gin.Context) bool) gin.HandlerFunc {
+// the user id + rank for the limiter/handlers and continues. allowKeyless (may
+// be nil) lets specific requests through without a key — used for caps
+// discovery. A resolve error (DB blip) fails closed: we don't serve what we
+// can't authenticate. Everything else gets the Newznab "incorrect credentials"
+// error. A rank lookup that fails degrades to RoleUser (base limits) rather than
+// rejecting a validly-keyed request.
+func requireAPIKey(resolve apikey.Resolver, roleOf func(context.Context, int64) (core.Role, error), logger *slog.Logger, allowKeyless func(*gin.Context) bool) gin.HandlerFunc {
 	return func(g *gin.Context) {
 		uid, ok, err := resolve(g.Request.Context(), g.Query("apikey"))
 		if err != nil {
 			logger.Warn("apikey resolve", "err", err)
 		}
 		if ok {
+			role := core.RoleUser
+			if r, rerr := roleOf(g.Request.Context(), uid); rerr == nil {
+				role = r
+			} else {
+				logger.Warn("role lookup", "uid", uid, "err", rerr)
+			}
 			g.Set(ctxUserID, uid)
+			g.Set(ctxUserRole, int(role))
 			g.Next()
 			return
 		}
@@ -348,6 +380,32 @@ func rateKey(g *gin.Context) string {
 		return "u:" + strconv.FormatInt(uid.(int64), 10)
 	}
 	return "ip:" + g.ClientIP()
+}
+
+// rankedLimit returns the per-request limit for baseKey, differentiated by the
+// caller's rank: staff (Mod+) are exempt (0 = no cap), Contributors get
+// base * rate_contributor_mult, everyone else the base. Keyless (caps) requests
+// have no rank stashed and fall back to the base.
+func rankedLimit(svc *schedule.JobInfo, baseKey string) func(*gin.Context) int {
+	return func(g *gin.Context) int {
+		base := svc.GetConfigInt(baseKey)
+		rv, ok := g.Get(ctxUserRole)
+		if !ok {
+			return base
+		}
+		switch role := core.Role(rv.(int)); {
+		case role >= core.RoleMod:
+			return 0 // staff exempt
+		case role >= core.RoleContributor:
+			mult := svc.GetConfigInt("rate_contributor_mult")
+			if mult < 1 {
+				mult = 1
+			}
+			return base * mult
+		default:
+			return base
+		}
+	}
 }
 
 // newznabAuthError renders a missing/invalid-key rejection as a Newznab error

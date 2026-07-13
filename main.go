@@ -35,10 +35,18 @@ import (
 	"github.com/ameNZB/loon-baseline/cache"
 	cachememory "github.com/ameNZB/loon-baseline/cache/memory"
 	cacheredis "github.com/ameNZB/loon-baseline/cache/redis"
+	"github.com/ameNZB/loon-baseline/jobsettings"
 
 	"github.com/ameNZB/loon-plugins/pluginapi"
 	_ "github.com/ameNZB/loon-plugins/usenet"
 )
+
+// apiServiceName is the schedule service the loon-api read tier registers for
+// its admin-editable settings (cache TTLs). The WEB admin registers a service
+// with this SAME name as a MarkRemote stub so an operator edits the values
+// there; loon-api reads them from the shared job_settings table. The names must
+// match — that's the join key.
+const apiServiceName = "Search API"
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -48,6 +56,23 @@ func main() {
 		logger.Error("db connect", "err", err)
 		os.Exit(1)
 	}
+
+	// Admin-editable settings for this read tier. The values live in the shared
+	// job_settings table (keyed by service name) and are edited from the WEB
+	// admin's config page; loon-api reads them here. Migrate is idempotent — the
+	// web process creates the same table.
+	settings := jobsettings.NewPGStore(db.DB)
+	if err := settings.Migrate(context.Background()); err != nil {
+		logger.Error("job_settings migrate", "err", err)
+		os.Exit(1)
+	}
+	apiSvc := schedule.RegisterService(apiServiceName, "Newznab/Torznab read tier (loon-api)")
+	apiSvc.DeclareConfig(settings,
+		schedule.JobConfigVar{Key: "cache_ttl_secs", Label: "Search cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "90",
+			Description: "How long search/tvsearch/movie/rss responses stay cached."},
+		schedule.JobConfigVar{Key: "caps_ttl_secs", Label: "Caps cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "3600",
+			Description: "How long the caps (category tree) response stays cached — nearly static."},
+	)
 
 	engine := gin.New()
 	engine.Use(gin.Recovery())
@@ -77,6 +102,23 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The schedule config cache is loaded once per process and only refreshed on
+	// an in-process SetConfig — which this read-only tier never calls. Re-read
+	// the shared table periodically so an admin's TTL edit in the web process
+	// takes effect here within the interval (no restart, no message bus).
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				apiSvc.RefreshConfig()
+			}
+		}
+	}()
 
 	rt, err := core.Boot(ctx, c)
 	if err != nil {
@@ -108,8 +150,8 @@ func main() {
 	}
 
 	engine.GET("/healthz", func(g *gin.Context) { g.String(http.StatusOK, "ok") })
-	engine.GET("/api", newznab(api, responses)) // Newznab/Torznab: t=caps|search|tvsearch|movie|rss|get
-	engine.GET("/rss", newznab(api, responses))
+	engine.GET("/api", newznab(api, responses, apiSvc)) // Newznab/Torznab: t=caps|search|tvsearch|movie|rss|get
+	engine.GET("/rss", newznab(api, responses, apiSvc))
 	engine.GET("/nzb/:id", nzb(idx))
 
 	srv := &http.Server{Addr: getenv("LOON_API_ADDR", ":8091"), Handler: engine}
@@ -134,7 +176,7 @@ type cachedResp struct {
 	Filename    string `json:"f"`
 }
 
-func newznab(api pluginapi.UsenetNewznab, ca cache.Cache) gin.HandlerFunc {
+func newznab(api pluginapi.UsenetNewznab, ca cache.Cache, svc *schedule.JobInfo) gin.HandlerFunc {
 	return func(g *gin.Context) {
 		if api == nil {
 			g.String(http.StatusServiceUnavailable, "indexer not configured")
@@ -174,7 +216,7 @@ func newznab(api pluginapi.UsenetNewznab, ca cache.Cache) gin.HandlerFunc {
 		}
 		cr := cachedResp{Body: res.Body, ContentType: res.ContentType, Filename: res.Filename}
 		if cacheable {
-			_ = cache.SetJSON(g.Request.Context(), ca, key, cr, ttlFor(req.Function))
+			_ = cache.SetJSON(g.Request.Context(), ca, key, cr, ttlFor(svc, req.Function))
 		}
 		writeResp(g, cr, "miss")
 	}
@@ -204,13 +246,21 @@ func newznabKey(r pluginapi.NewznabRequest) string {
 	return "newznab:v1:" + hex.EncodeToString(sum[:16])
 }
 
-// ttlFor picks a per-function TTL. Caps are ~static (the category tree); search
-// / feed results get a short window balancing hit rate against freshness.
-func ttlFor(fn string) time.Duration {
+// ttlFor picks a per-function TTL from the read tier's admin-editable settings
+// (refreshed periodically from the shared job_settings table). Caps are ~static
+// (the category tree) so they cache far longer than search/feed results. A
+// non-positive override (admin typo, or a var not yet declared) falls back to a
+// sane built-in so the cache never gets a 0 / negative TTL.
+func ttlFor(svc *schedule.JobInfo, fn string) time.Duration {
+	key, fallback := "cache_ttl_secs", 90
 	if fn == "caps" {
-		return time.Hour
+		key, fallback = "caps_ttl_secs", 3600
 	}
-	return 90 * time.Second
+	secs := svc.GetConfigInt(key)
+	if secs <= 0 {
+		secs = fallback
+	}
+	return time.Duration(secs) * time.Second
 }
 
 func nzb(idx pluginapi.UsenetIndex) gin.HandlerFunc {

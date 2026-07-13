@@ -1,4 +1,10 @@
-# loon-api
+<p align="center">
+  <img src="img/logo.png" alt="loon" width="180">
+</p>
+
+<h1 align="center">loon-api</h1>
+
+<p align="center">A standalone read-only API worker for a <a href="https://github.com/ameNZB/loon">loon</a> indexer.</p>
 
 A standalone, read-only **API host** for a [loon](https://github.com/ameNZB/loon)
 indexer. It boots loon in the `api` process and mounts **only** the

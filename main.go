@@ -220,7 +220,7 @@ func main() {
 	engine.GET("/healthz", func(g *gin.Context) { g.String(http.StatusOK, "ok") })
 	engine.GET("/api", authAPI, limiter, newznab(api, responses, apiSvc)) // t=caps|search|tvsearch|movie|rss|get
 	engine.GET("/rss", authFeed, limiter, newznab(api, responses, apiSvc))
-	engine.GET("/nzb/:id", nzb(idx))
+	engine.GET("/nzb/:id", authFeed, nzb(idx)) // direct download route — same key requirement as /api?t=get
 
 	srv := &http.Server{Addr: getenv("LOON_API_ADDR", ":8091"), Handler: engine}
 	go func() {
@@ -358,6 +358,15 @@ func requireAPIKey(resolve apikey.Resolver, roleOf func(context.Context, int64) 
 			} else {
 				logger.Warn("role lookup", "uid", uid, "err", rerr)
 			}
+			// Banned/disabled accounts keep a valid key but lose API access.
+			// (A role-lookup error degrades to RoleUser above, so this only
+			// fires on a confirmed low rank — it won't lock everyone out on a
+			// users-table blip.)
+			if role <= core.RoleDisabled {
+				newznabSuspendedError(g)
+				g.Abort()
+				return
+			}
 			g.Set(ctxUserID, uid)
 			g.Set(ctxUserRole, int(role))
 			g.Next()
@@ -413,6 +422,13 @@ func rankedLimit(svc *schedule.JobInfo, baseKey string) func(*gin.Context) int {
 func newznabAuthError(g *gin.Context) {
 	g.Data(http.StatusUnauthorized, "application/xml; charset=utf-8",
 		[]byte(`<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<error code="100" description="Incorrect user credentials"/>`))
+}
+
+// newznabSuspendedError rejects a banned/disabled account (valid key, no access)
+// with the Newznab spec's "Account suspended" error (code 101) + HTTP 403.
+func newznabSuspendedError(g *gin.Context) {
+	g.Data(http.StatusForbidden, "application/xml; charset=utf-8",
+		[]byte(`<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<error code="101" description="Account suspended"/>`))
 }
 
 // newznabLimitError renders an over-limit rejection as a Newznab error document

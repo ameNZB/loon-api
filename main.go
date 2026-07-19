@@ -26,21 +26,21 @@ import (
 	_ "github.com/lib/pq"
 	goredis "github.com/redis/go-redis/v9"
 
-	"github.com/ameNZB/loon/core"
-	"github.com/ameNZB/loon/schedule"
+	"github.com/the-loon-clan/loon/core"
+	"github.com/the-loon-clan/loon/schedule"
 
-	"github.com/ameNZB/loon-baseline/apikey"
-	"github.com/ameNZB/loon-baseline/cache"
-	cachememory "github.com/ameNZB/loon-baseline/cache/memory"
-	cacheredis "github.com/ameNZB/loon-baseline/cache/redis"
-	"github.com/ameNZB/loon-baseline/jobsettings"
-	"github.com/ameNZB/loon-baseline/ratelimit"
-	rlmemory "github.com/ameNZB/loon-baseline/ratelimit/memory"
-	rlredis "github.com/ameNZB/loon-baseline/ratelimit/redis"
-	"github.com/ameNZB/loon-baseline/users"
+	"github.com/the-loon-clan/loon-baseline/apikey"
+	"github.com/the-loon-clan/loon-baseline/cache"
+	cachememory "github.com/the-loon-clan/loon-baseline/cache/memory"
+	cacheredis "github.com/the-loon-clan/loon-baseline/cache/redis"
+	"github.com/the-loon-clan/loon-baseline/jobsettings"
+	"github.com/the-loon-clan/loon-baseline/ratelimit"
+	rlmemory "github.com/the-loon-clan/loon-baseline/ratelimit/memory"
+	rlredis "github.com/the-loon-clan/loon-baseline/ratelimit/redis"
+	"github.com/the-loon-clan/loon-baseline/users"
 
-	"github.com/ameNZB/loon-plugins/pluginapi"
-	_ "github.com/ameNZB/loon-plugins/usenet"
+	"github.com/the-loon-clan/loon-plugins/pluginapi"
+	_ "github.com/the-loon-clan/loon-plugins/usenet"
 )
 
 // apiServiceName is the schedule service the loon-api read tier registers for

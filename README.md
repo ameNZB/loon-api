@@ -4,9 +4,9 @@
 
 <h1 align="center">loon-api</h1>
 
-<p align="center">A standalone read-only API worker for a <a href="https://github.com/ameNZB/loon">loon</a> indexer.</p>
+<p align="center">A standalone read-only API worker for a <a href="https://github.com/The-Loon-Clan/loon">loon</a> indexer.</p>
 
-A standalone, read-only **API host** for a [loon](https://github.com/ameNZB/loon)
+A standalone, read-only **API host** for a [loon](https://github.com/The-Loon-Clan/loon)
 indexer. It boots loon in the `api` process and mounts **only** the
 Newznab/Torznab search API + NZB download — no sessions, templates, admin, or
 view system. Run several behind a load balancer as a horizontally-scalable read
